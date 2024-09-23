@@ -5,16 +5,20 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-const SIZE: usize = usize::pow(2, 21);
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let mut file = File::open(&args[1]).await?;
 
+    let buf_size: usize = args
+        .get(2)
+        .unwrap_or(&"2097152".to_string())
+        .parse()
+        .unwrap();
+
     let mut chunk_idx = 0;
-    let mut chunk1 = vec![0; SIZE];
-    let mut chunk2 = vec![0; SIZE];
+    let mut chunk1 = vec![0; buf_size];
+    let mut chunk2 = vec![0; buf_size];
     let mut spawns = vec![];
 
     let mut results: FxHashMap<String, (f64, f64, f64, u32)> = FxHashMap::default();
@@ -56,8 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut chunk2
         };
         let chunk_size = chunk.len();
-        if chunk_size < SIZE / 2 {
-            chunk.resize(SIZE, 0);
+        if chunk_size < buf_size / 2 {
+            chunk.resize(buf_size, 0);
         }
         let len = file.read(chunk).await?;
         //eprintln!("Len: {}", len);
