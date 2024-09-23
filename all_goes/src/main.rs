@@ -1,62 +1,74 @@
-use std::sync::{Arc, Mutex};
+use std::env;
 
+use rustc_hash::FxHashMap;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::join;
+use tokio::sync::mpsc;
 
-const SIZE: usize = usize::pow(2, 20);
+const SIZE: usize = usize::pow(2, 21);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = File::open("../data/1_000_000_000_rows").await?;
+    let args: Vec<String> = env::args().collect();
+    let mut file = File::open(&args[1]).await?;
 
     let mut chunk_idx = 0;
     let mut chunk1 = vec![0; SIZE];
     let mut chunk2 = vec![0; SIZE];
     let mut spawns = vec![];
 
-    let min = Arc::new(Mutex::new(f64::MAX));
-    let max = Arc::new(Mutex::new(0.0));
-    let sum = Arc::new(Mutex::new(0.0));
-    let total = Arc::new(Mutex::new(0));
+    let mut results: FxHashMap<String, (f64, f64, f64, u32)> = FxHashMap::default();
+    let (tx, mut rx) = mpsc::channel(1000);
+
+    tokio::spawn(async move {
+        while let Some(new_results) = rx.recv().await {
+            for (key, (new_min, new_max, new_sum, new_total)) in new_results {
+                let (min, max, sum, total) =
+                    results.entry(key).or_insert((f64::MAX, f64::MIN, 0.0, 0));
+                *sum += new_sum;
+                if new_min < *min {
+                    *min = new_min;
+                }
+                if new_max > *max {
+                    *max = new_max;
+                }
+                *total += new_total;
+            }
+        }
+
+        for (key, (min, max, sum, total)) in results {
+            println!(
+                "Name: {}, Min: {}, Max: {}, Avg: {:.1}",
+                key,
+                min,
+                max,
+                (sum / (total as f64)),
+            );
+        }
+    });
 
     loop {
-        let min_clone = min.clone();
-        let max_clone = max.clone();
-        let sum_clone = sum.clone();
-        let total_clone = total.clone();
-
         let chunk = if chunk_idx % 2 == 0 {
+            //eprintln!("Chunk1: {:?}", chunk1.last());
             &mut chunk1
         } else {
+            //eprintln!("Chunk2: {:?}", chunk2.last());
             &mut chunk2
         };
-        let len = file.read(chunk).await?;
         let chunk_size = chunk.len();
+        if chunk_size < SIZE / 2 {
+            chunk.resize(SIZE, 0);
+        }
+        let len = file.read(chunk).await?;
+        //eprintln!("Len: {}", len);
         if len == 0 {
             // Length of zero means end of file. Do final chunk
-            eprintln!(
-                "Chunk1: {:?} {:?}",
-                chunk1.len(),
-                &chunk1[chunk1.len() - 10..]
-            );
-            eprintln!(
-                "Chunk2: {:?} {:?}",
-                chunk2.len(),
-                &chunk2[chunk2.len() - 10..]
-            );
             let chunk = if chunk_idx % 2 == 0 { chunk2 } else { chunk1 };
-            eprintln!("Final chunk: {:?}", chunk.len());
-            spawns.push(tokio::spawn(spawned_thread(
-                chunk,
-                min_clone,
-                max_clone,
-                sum_clone,
-                total_clone,
-            )));
+            spawns.push(tokio::spawn(spawned_working(chunk, tx.clone())));
             break;
         } else if len < chunk_size {
-            chunk.iter_mut().skip(len).for_each(|ch| *ch = 0);
+            // eprintln!("Smaller len");
+            chunk[len] = 0;
         }
 
         if chunk_idx == 0 {
@@ -90,13 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chunk
         };
 
-        spawns.push(tokio::spawn(spawned_thread(
-            chunk,
-            min_clone,
-            max_clone,
-            sum_clone,
-            total_clone,
-        )));
+        spawns.push(tokio::spawn(spawned_working(chunk, tx.clone())));
 
         chunk_idx += 1;
     }
@@ -107,73 +113,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Done");
 
-    println!("Min: {}", *min.lock().unwrap());
-    println!("Max: {}", *max.lock().unwrap());
-    println!("Sum: {}", *sum.lock().unwrap());
-    println!(
-        "Avg: {}",
-        *sum.lock().unwrap() / *total.lock().unwrap() as f64
-    );
-    println!("Total: {}", *total.lock().unwrap());
-
     Ok(())
 }
 
-async fn spawned_thread(
+async fn spawned_working(
     chunk: Vec<u8>,
-    min: Arc<Mutex<f64>>,
-    max: Arc<Mutex<f64>>,
-    sum: Arc<Mutex<f64>>,
-    total: Arc<Mutex<u32>>,
+    tx: mpsc::Sender<FxHashMap<String, (f64, f64, f64, u32)>>,
 ) {
-    let (chunk_min, chunk_sum, chunk_max, chunk_num) = process_chunk(chunk);
-
-    let current_min = *min.lock().unwrap();
-    if chunk_min < current_min {
-        *min.lock().unwrap() = chunk_min
-    };
-
-    let current_max = *max.lock().unwrap();
-    if chunk_max > current_max {
-        *max.lock().unwrap() = chunk_max
-    };
-
-    let current_sum = *sum.lock().unwrap();
-    *sum.lock().unwrap() = current_sum + chunk_sum;
-
-    let current_total = *total.lock().unwrap();
-    *total.lock().unwrap() = current_total + chunk_num;
-}
-
-fn process_chunk(chunk: Vec<u8>) -> (f64, f64, f64, u32) {
-    let mut min = f64::MAX;
-    let mut sum = 0.0;
-    let mut max = 0.0;
-    let mut total = 0;
-
-    let lines = chunk.split(|&ch| ch == b'\n');
-    for line in lines {
-        if line == b"" || line.first() == Some(&0) {
-            continue;
-        }
-        let line = std::str::from_utf8(line).unwrap();
-        match line.parse::<f64>() {
-            Ok(number) => {
-                sum += number;
-                if number < min {
-                    min = number;
-                }
-                if number > max {
-                    max = number;
-                }
-                total += 1;
+    let mut results: FxHashMap<String, (f64, f64, f64, u32)> = FxHashMap::default();
+    let mut name = "";
+    let mut idx = 0;
+    for j in 0..chunk.len() {
+        if chunk[j] == b';' {
+            name = std::str::from_utf8(&chunk[idx..j]).unwrap();
+            idx = j + 1;
+        } else if chunk[j] == b'\n' {
+            let number = std::str::from_utf8(&chunk[idx..j])
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            let (min, max, sum, total) =
+                results
+                    .entry(name.to_string())
+                    .or_insert((f64::MAX, f64::MIN, 0.0, 0));
+            *sum += number;
+            if number < *min {
+                *min = number;
             }
-            Err(err) => {
-                eprintln!("Line: {:?}", line);
-                eprintln!("Error: {}", err);
+            if number > *max {
+                *max = number;
             }
+            *total += 1;
+            idx = j + 1;
         }
     }
 
-    (min, sum, max, total)
+    tx.send(results).await.unwrap();
 }
