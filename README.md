@@ -1,3 +1,5 @@
-Billion row challenge attempts
+# Billion row challenge
 
-https://asciinema.org/a/ljqSud5Fk9bZOlF2XaYEXy3FW
+https://1brc.dev
+
+[![asciicast](https://asciinema.org/a/ljqSud5Fk9bZOlF2XaYEXy3FW.svg)](https://asciinema.org/a/ljqSud5Fk9bZOlF2XaYEXy3FW)
