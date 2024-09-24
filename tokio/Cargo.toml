@@ -1,0 +1,8 @@
+[package]
+name = "all_goes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustc-hash = "2.0.0"
+tokio = { version = "1.40.0", features = ["bytes", "fs", "full", "io-std", "macros", "rt-multi-thread"] }

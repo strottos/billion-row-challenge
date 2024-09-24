@@ -1,31 +1,31 @@
-use std::env;
+use std::{env, fs::File, sync::mpsc, thread, time::SystemTime};
 
+use bytes::Bytes;
+use memmap2::MmapOptions;
 use rustc_hash::FxHashMap;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let start = SystemTime::now();
+    eprintln!(
+        "Starting: {}",
+        SystemTime::now().duration_since(start)?.as_millis()
+    );
+
     let args: Vec<String> = env::args().collect();
-    let mut file = File::open(&args[1]).await?;
+    let file = File::open(&args[1])?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-    let buf_size: usize = args
-        .get(2)
-        .unwrap_or(&"2097152".to_string())
-        .parse()
-        .unwrap();
+    let chunk_size: usize = match args.get(2) {
+        Some(chunk_size) => chunk_size.parse().unwrap_or(2_usize.pow(20)),
+        None => 2_usize.pow(20),
+    };
 
-    let mut chunk_idx = 0;
-    let mut chunk1 = vec![0; buf_size];
-    let mut chunk2 = vec![0; buf_size];
-    let mut spawns = vec![];
+    let (results_tx, results_rx) = mpsc::channel();
 
-    let mut results: FxHashMap<String, (f64, f64, f64, u32)> = FxHashMap::default();
-    let (tx, mut rx) = mpsc::channel(1000);
+    let mut results: FxHashMap<Bytes, (f64, f64, f64, u32)> = FxHashMap::default();
 
-    tokio::spawn(async move {
-        while let Some(new_results) = rx.recv().await {
+    let thread = thread::spawn(move || {
+        while let Ok(new_results) = results_rx.recv() {
             for (key, (new_min, new_max, new_sum, new_total)) in new_results {
                 let (min, max, sum, total) =
                     results.entry(key).or_insert((f64::MAX, f64::MIN, 0.0, 0));
@@ -40,10 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        println!("Done");
         for (key, (min, max, sum, total)) in results {
             println!(
                 "Name: {}, Min: {}, Max: {}, Avg: {:.1}",
-                key,
+                std::str::from_utf8(&key).unwrap(),
                 min,
                 max,
                 (sum / (total as f64)),
@@ -51,95 +52,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    loop {
-        let chunk = if chunk_idx % 2 == 0 {
-            //eprintln!("Chunk1: {:?}", chunk1.last());
-            &mut chunk1
-        } else {
-            //eprintln!("Chunk2: {:?}", chunk2.last());
-            &mut chunk2
-        };
-        let chunk_size = chunk.len();
-        if chunk_size < buf_size / 2 {
-            chunk.resize(buf_size, 0);
-        }
-        let len = file.read(chunk).await?;
-        //eprintln!("Len: {}", len);
-        if len == 0 {
-            // Length of zero means end of file. Do final chunk
-            let chunk = if chunk_idx % 2 == 0 { chunk2 } else { chunk1 };
-            spawns.push(tokio::spawn(spawned_working(chunk, tx.clone())));
-            break;
-        } else if len < chunk_size {
-            // eprintln!("Smaller len");
-            chunk[len] = 0;
-        }
+    rayon::scope(|s| {
+        let mut chunk_from = 0;
+        loop {
+            let chunk_to = if chunk_from + chunk_size < mmap.len() {
+                chunk_from
+                    + chunk_size
+                    + mmap[chunk_from + chunk_size..]
+                        .iter()
+                        .position(|&x| x == b'\n')
+                        .unwrap()
+            } else {
+                mmap.len()
+            };
+            let chunk = &mmap[chunk_from..chunk_to];
 
-        if chunk_idx == 0 {
-            chunk_idx += 1;
-            continue;
-        }
+            let results_tx_clone = results_tx.clone();
+            s.spawn(move |_| {
+                spawned_working(chunk, results_tx_clone);
+            });
 
-        let chunk = if chunk_idx % 2 == 1 {
-            let mut chunk = chunk1.clone();
-            if chunk.last().unwrap() != &b'\n' {
-                for (idx, ch) in chunk2.iter().enumerate() {
-                    chunk.push(*ch);
-                    if ch == &b'\n' {
-                        chunk2 = chunk2.split_off(idx + 1);
-                        break;
-                    }
-                }
+            chunk_from = chunk_to + 1;
+
+            if chunk_from >= mmap.len() {
+                break;
             }
-            chunk
-        } else {
-            let mut chunk = chunk2.clone();
-            if chunk.last().unwrap() != &b'\n' {
-                for (idx, ch) in chunk1.iter().enumerate() {
-                    chunk.push(*ch);
-                    if ch == &b'\n' {
-                        chunk1 = chunk1.split_off(idx + 1);
-                        break;
-                    }
-                }
-            }
-            chunk
-        };
+        }
+    });
 
-        spawns.push(tokio::spawn(spawned_working(chunk, tx.clone())));
+    eprintln!(
+        "Processed all: {}",
+        SystemTime::now().duration_since(start)?.as_millis()
+    );
 
-        chunk_idx += 1;
-    }
+    drop(results_tx);
 
-    for spawn in spawns {
-        spawn.await?;
-    }
-
-    println!("Done");
+    thread.join().unwrap();
 
     Ok(())
 }
 
-async fn spawned_working(
-    chunk: Vec<u8>,
-    tx: mpsc::Sender<FxHashMap<String, (f64, f64, f64, u32)>>,
-) {
-    let mut results: FxHashMap<String, (f64, f64, f64, u32)> = FxHashMap::default();
-    let mut name = "";
-    let mut idx = 0;
-    for j in 0..chunk.len() {
-        if chunk[j] == b';' {
-            name = std::str::from_utf8(&chunk[idx..j]).unwrap();
-            idx = j + 1;
-        } else if chunk[j] == b'\n' {
-            let number = std::str::from_utf8(&chunk[idx..j])
-                .unwrap()
-                .parse::<f64>()
-                .unwrap();
+fn spawned_working(chunk: &[u8], results_tx: mpsc::Sender<FxHashMap<Bytes, (f64, f64, f64, u32)>>) {
+    let mut results: FxHashMap<Bytes, (f64, f64, f64, u32)> = FxHashMap::default();
+
+    let mut name_idx_from = 0;
+    let mut name_idx_to = 0;
+    let mut float_idx_from = 0;
+
+    for (idx, ch) in chunk.iter().enumerate() {
+        if *ch == b';' {
+            name_idx_to = idx;
+            float_idx_from = idx + 1;
+        } else if *ch == b'\n' {
+            let name = Bytes::copy_from_slice(&chunk[name_idx_from..name_idx_to]);
+            let number: f64 = fast_float::parse(&chunk[float_idx_from..idx]).unwrap();
+
             let (min, max, sum, total) =
-                results
-                    .entry(name.to_string())
-                    .or_insert((f64::MAX, f64::MIN, 0.0, 0));
+                results.entry(name).or_insert((f64::MAX, f64::MIN, 0.0, 0));
+
             *sum += number;
             if number < *min {
                 *min = number;
@@ -148,9 +118,10 @@ async fn spawned_working(
                 *max = number;
             }
             *total += 1;
-            idx = j + 1;
+
+            name_idx_from = idx + 1;
         }
     }
 
-    tx.send(results).await.unwrap();
+    results_tx.send(results).unwrap();
 }
